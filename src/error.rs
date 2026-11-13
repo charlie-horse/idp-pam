@@ -37,7 +37,17 @@ impl PamCode {
     /// Converts to the raw `pam-bindings` result code.
     #[must_use]
     pub fn to_pam(self) -> PamResultCode {
-        todo!()
+        match self {
+            Self::Success => PamResultCode::PAM_SUCCESS,
+            Self::Ignore => PamResultCode::PAM_IGNORE,
+            Self::AuthErr => PamResultCode::PAM_AUTH_ERR,
+            Self::MaxTries => PamResultCode::PAM_MAXTRIES,
+            Self::AuthInfoUnavail => PamResultCode::PAM_AUTHINFO_UNAVAIL,
+            Self::ConvErr => PamResultCode::PAM_CONV_ERR,
+            Self::ServiceErr => PamResultCode::PAM_SERVICE_ERR,
+            Self::UserUnknown => PamResultCode::PAM_USER_UNKNOWN,
+            Self::Abort => PamResultCode::PAM_ABORT,
+        }
     }
 }
 
@@ -88,13 +98,38 @@ impl Error {
     /// | `Claim`, `Token` | `AuthErr` |
     #[must_use]
     pub fn pam_code(&self) -> PamCode {
-        todo!()
+        match self {
+            Self::Config(_) => PamCode::ServiceErr,
+            Self::Conv => PamCode::ConvErr,
+            Self::UserUnknown => PamCode::UserUnknown,
+            Self::Network(_) | Self::Tls(_) | Self::Idp(_) | Self::Secret(_) => {
+                PamCode::AuthInfoUnavail
+            }
+            Self::Denied | Self::Expired | Self::Cancelled | Self::BadMenuInput => {
+                PamCode::MaxTries
+            }
+            Self::Claim(_) | Self::Token(_) => PamCode::AuthErr,
+        }
     }
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(s) => write!(f, "bad module arguments: {s}"),
+            Self::Conv => f.write_str("conversation failed"),
+            Self::UserUnknown => f.write_str("no user name"),
+            Self::Network(s) => write!(f, "network error: {s}"),
+            Self::Tls(s) => write!(f, "TLS error: {s}"),
+            Self::Idp(s) => write!(f, "identity provider error: {s}"),
+            Self::Denied => f.write_str("denied at the identity provider"),
+            Self::Expired => f.write_str("device code expired"),
+            Self::Cancelled => f.write_str("cancelled by the user"),
+            Self::BadMenuInput => f.write_str("too many invalid menu answers"),
+            Self::Claim(s) => write!(f, "claim check failed: {s}"),
+            Self::Token(s) => write!(f, "ID token rejected: {s}"),
+            Self::Secret(s) => write!(f, "client secret unusable: {s}"),
+        }
     }
 }
 

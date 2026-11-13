@@ -25,6 +25,7 @@
 //! | `qr` | `on` | `on`, `off`, `invert` |
 //! | `debug` | off | Bare flag (or `debug=true`/`false`) |
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -61,6 +62,17 @@ pub enum Method {
     Pass,
     /// OAuth 2.0 device flow against the issuer. Spelled `sso` in arguments.
     Sso,
+}
+
+impl Method {
+    /// The spelling used in arguments and in the log line.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "password",
+            Self::Sso => "sso",
+        }
+    }
 }
 
 /// When polling for the token starts.
@@ -177,23 +189,179 @@ impl Config {
     /// # Errors
     /// [`Error::Config`] for unknown or duplicate keys, missing `issuer`/`client_id`,
     /// bad values, or a non-`https` URL.
-    pub fn parse(_args: &[&str]) -> Result<Self, Error> {
-        todo!()
+    pub fn parse(args: &[&str]) -> Result<Self, Error> {
+        let mut map = BTreeMap::new();
+        for &arg in args {
+            let (key, value) = arg
+                .split_once('=')
+                .or_else(|| (arg == "debug").then_some((arg, "true")))
+                .ok_or_else(|| bad(arg, "expected key=value"))?;
+            if map.insert(key, value).is_some() {
+                return Err(bad(key, "given twice"));
+            }
+        }
+        let issuer = https_url("issuer", required(&map, "issuer")?)?;
+        let client_id = non_empty("client_id", required(&map, "client_id")?)?;
+        let mut cfg = Self::new(issuer, client_id);
+        for (&key, &value) in &map {
+            match key {
+                "issuer" | "client_id" | "default" | "labels" => {}
+                "methods" => cfg.methods = methods(value)?,
+                "secret_file" => cfg.secret_file = non_empty(key, value)?.into(),
+                "ca_file" => cfg.ca_file = non_empty(key, value)?.into(),
+                "device_endpoint" => {
+                    let url = https_url(key, value)?;
+                    if url.origin() != cfg.issuer.origin() {
+                        return Err(bad(key, "must be on the issuer's host"));
+                    }
+                    cfg.device_endpoint = Some(url);
+                }
+                "scopes" => cfg.scopes = list(key, value)?,
+                "username_claim" => non_empty(key, value)?.clone_into(&mut cfg.username_claim),
+                "groups_claim" => non_empty(key, value)?.clone_into(&mut cfg.groups_claim),
+                "require_group" => cfg.require_group = list(key, value)?,
+                "connect_timeout" => cfg.connect_timeout = seconds(key, value)?,
+                "timeout" => cfg.timeout = seconds(key, value)?,
+                "max_wait" => cfg.max_wait = seconds(key, value)?,
+                "wait" => {
+                    cfg.wait = choice(
+                        key,
+                        value,
+                        &[
+                            ("auto", WaitMode::Auto),
+                            ("enter", WaitMode::Enter),
+                            ("poll", WaitMode::Poll),
+                        ],
+                    )?;
+                }
+                "qr" => {
+                    cfg.qr = choice(
+                        key,
+                        value,
+                        &[
+                            ("on", QrMode::On),
+                            ("off", QrMode::Off),
+                            ("invert", QrMode::Invert),
+                        ],
+                    )?;
+                }
+                "debug" => cfg.debug = choice(key, value, &[("true", true), ("false", false)])?,
+                _ => return Err(bad(key, "unknown key")),
+            }
+        }
+        cfg.default_method = map
+            .get("default")
+            .map_or(Ok(cfg.methods[0]), |v| method("default", v))?;
+        if !cfg.methods.contains(&cfg.default_method) {
+            return Err(bad("default", "not one of methods"));
+        }
+        if let Some(value) = map.get("labels") {
+            let labels = list("labels", value)?;
+            if labels.len() != cfg.methods.len() {
+                return Err(bad("labels", "need one label per method"));
+            }
+            for (&m, label) in cfg.methods.iter().zip(labels) {
+                *match m {
+                    Method::Pass => &mut cfg.labels.pass,
+                    Method::Sso => &mut cfg.labels.sso,
+                } = label;
+            }
+        }
+        Ok(cfg)
     }
 
     /// The effective wait mode for `service`: [`WaitMode::Auto`] becomes
     /// [`WaitMode::Enter`] for `"sshd"` and [`WaitMode::Poll`] otherwise;
     /// explicit modes are returned unchanged.
     #[must_use]
-    pub fn wait_mode_for(&self, _service: Option<&str>) -> WaitMode {
-        todo!()
+    pub fn wait_mode_for(&self, service: Option<&str>) -> WaitMode {
+        match self.wait {
+            WaitMode::Auto if service == Some("sshd") => WaitMode::Enter,
+            WaitMode::Auto => WaitMode::Poll,
+            mode => mode,
+        }
     }
 
     /// The menu label for `method`.
     #[must_use]
-    pub fn label(&self, _method: Method) -> &str {
-        todo!()
+    pub fn label(&self, method: Method) -> &str {
+        match method {
+            Method::Pass => &self.labels.pass,
+            Method::Sso => &self.labels.sso,
+        }
     }
+}
+
+/// An [`Error::Config`] naming `key`.
+fn bad(key: &str, why: &str) -> Error {
+    Error::Config(format!("{key}: {why}"))
+}
+
+/// The value of a required key.
+fn required<'a>(map: &BTreeMap<&str, &'a str>, key: &str) -> Result<&'a str, Error> {
+    map.get(key).copied().ok_or_else(|| bad(key, "missing"))
+}
+
+fn non_empty<'a>(key: &str, value: &'a str) -> Result<&'a str, Error> {
+    if value.is_empty() {
+        Err(bad(key, "empty value"))
+    } else {
+        Ok(value)
+    }
+}
+
+/// A comma-separated list of non-empty items.
+fn list(key: &str, value: &str) -> Result<Vec<String>, Error> {
+    value
+        .split(',')
+        .map(|item| non_empty(key, item).map(str::to_owned))
+        .collect()
+}
+
+fn https_url(key: &str, value: &str) -> Result<Url, Error> {
+    Url::parse(value)
+        .ok()
+        .filter(|url| url.scheme() == "https")
+        .ok_or_else(|| bad(key, "must be an https URL"))
+}
+
+/// A positive whole number of seconds.
+fn seconds(key: &str, value: &str) -> Result<Duration, Error> {
+    value
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| bad(key, "must be a positive number of seconds"))
+}
+
+/// One of the named `options`.
+fn choice<T: Copy>(key: &str, value: &str, options: &[(&str, T)]) -> Result<T, Error> {
+    options
+        .iter()
+        .find(|(name, _)| *name == value)
+        .map(|&(_, v)| v)
+        .ok_or_else(|| bad(key, "unknown value"))
+}
+
+fn method(key: &str, value: &str) -> Result<Method, Error> {
+    [Method::Pass, Method::Sso]
+        .into_iter()
+        .find(|m| m.name() == value)
+        .ok_or_else(|| bad(key, "unknown method"))
+}
+
+/// A non-empty list of distinct methods.
+fn methods(value: &str) -> Result<Vec<Method>, Error> {
+    let mut out = Vec::new();
+    for item in value.split(',') {
+        let m = method("methods", item)?;
+        if out.contains(&m) {
+            return Err(bad("methods", "duplicate method"));
+        }
+        out.push(m);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

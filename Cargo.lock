@@ -1350,7 +1350,7 @@ version = "0.1.0"
 dependencies = [
  "http",
  "httpmock",
- "oauth2",
+ "libc",
  "openidconnect",
  "pam-bindings",
  "qrcode",
