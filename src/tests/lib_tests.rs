@@ -751,15 +751,18 @@ fn nothing_secret_is_logged_or_shown() {
     let line = env.log_line();
     let screen = conv.screen();
     let id_token = env.id_token("alice", &["users", "admins"]);
-    for secret in [
+    for (i, secret) in [
         CLIENT_SECRET,
         DEVICE_CODE,
         ACCESS_TOKEN,
         &id_token,
         "SECRET",
-    ] {
-        assert!(!line.contains(secret), "log leaks {secret}: {line}");
-        assert!(!screen.contains(secret), "screen leaks {secret}: {screen}");
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(!line.contains(secret), "log line leaks secret #{i}");
+        assert!(!screen.contains(secret), "screen leaks secret #{i}");
     }
     assert!(!line.contains(USER_CODE), "log has the user code: {line}");
 }

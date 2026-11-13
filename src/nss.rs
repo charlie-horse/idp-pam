@@ -28,21 +28,23 @@ pub fn account_name(user: &str) -> Option<String> {
     // `pwd` and `result` are writable, and `buf` is writable for `buf.len()`
     // bytes. `getpwnam_r` is thread-safe and sets `result` to NULL on any
     // failure or a missing entry.
-    unsafe {
+    let rc = unsafe {
         libc::getpwnam_r(
             name.as_ptr(),
             pwd.as_mut_ptr(),
             buf.as_mut_ptr(),
             buf.len(),
             &raw mut result,
-        );
-    }
-    if result.is_null() {
+        )
+    };
+    if rc != 0 || result.is_null() {
         return None;
     }
-    // SAFETY: `result` points at `pwd`, filled in by the successful call;
-    // its `pw_name` is a NUL-terminated string inside `buf`, still alive.
-    let pw_name = unsafe { CStr::from_ptr((*result).pw_name) };
+    // SAFETY: a zero return with a non-NULL `result` means `getpwnam_r` filled
+    // in `pwd` (and `result` points at it). Read through `pwd` itself rather
+    // than the out-pointer. Its `pw_name` is a NUL-terminated string inside
+    // `buf`, which is still alive.
+    let pw_name = unsafe { CStr::from_ptr(pwd.assume_init_ref().pw_name) };
     Some(pw_name.to_string_lossy().into_owned())
 }
 

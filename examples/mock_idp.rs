@@ -225,10 +225,9 @@ impl Idp {
             Decision::Approve { user, .. } => format!("approve {user}"),
             d => format!("{d:?}").to_lowercase(),
         };
-        eprintln!(
-            "{} {} -> {status} (decision: {detail})",
-            req.method, req.path
-        );
+        // Only the request line and the scripted decision: never response
+        // bodies, codes or tokens.
+        eprintln!("{} {} (decision: {detail})", req.method, req.path);
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",

@@ -192,33 +192,59 @@ unsafe extern "C" fn conversation(
 
 const MODULE_FILE: &str = "libpam_idp.so";
 
-/// `target/<profile>/libpam_idp.so`, found from this test binary
-/// (`target/<profile>/deps/ffi-*`), else from `CARGO_TARGET_DIR` or
-/// `$CARGO_MANIFEST_DIR/target` with the `debug` and `release` profiles.
+/// The `libpam_idp.so` cargo built for this very test run.
+///
+/// Only this run's target directory is searched: cargo sets
+/// `CARGO_TARGET_TMPDIR` to `<target-dir>/tmp` at compile time, which is right
+/// under `--target-dir`, `CARGO_TARGET_DIR`, `cargo llvm-cov` and the Nix
+/// build. Where the cdylib lands inside `<target-dir>/<profile>/` depends on
+/// the cargo version (`deps/`, or `build/pam-idp/<hash>/` with the newer
+/// build-dir layout), so that profile tree is searched and the newest copy
+/// wins. Nothing outside it is considered, so a stale build elsewhere can never
+/// stand in for the module under test.
 fn module_path() -> PathBuf {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(deps) = exe.parent()
-    {
-        if let Some(profile) = deps.parent() {
-            candidates.push(profile.join(MODULE_FILE));
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("CARGO_TARGET_TMPDIR has a parent")
+        .join(profile);
+    let mut found: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut dirs = vec![(root.clone(), 0u8)];
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                // Skip `incremental/` and `.fingerprint/`; the module sits at
+                // most four levels down.
+                let name = entry.file_name();
+                if depth < 4 && name != "incremental" && name != ".fingerprint" {
+                    dirs.push((path, depth + 1));
+                }
+            } else if entry.file_name() == MODULE_FILE {
+                let modified = meta.modified().expect("mtime is supported");
+                if found.as_ref().is_none_or(|(t, _)| modified > *t) {
+                    found = Some((modified, path));
+                }
+            }
         }
-        candidates.push(deps.join(MODULE_FILE));
     }
-    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
-        PathBuf::from,
-    );
-    for profile in ["debug", "release"] {
-        candidates.push(target.join(profile).join(MODULE_FILE));
-    }
-    candidates
-        .iter()
-        .find(|p| p.is_file())
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!("{MODULE_FILE} not built; looked in {candidates:?} (run `cargo build` first)")
-        })
+    found.map_or_else(
+        || {
+            panic!(
+                "{MODULE_FILE} not built under {} (run `cargo test` or `cargo build` first)",
+                root.display()
+            )
+        },
+        |(_, p)| p,
+    )
 }
 
 /// A temporary PAM confdir holding one service file.

@@ -422,11 +422,11 @@ fn assert_one_clean_log_line(o: &Outcome, user: &str) {
     assert_eq!(o.log.len(), 1, "expected one syslog line: {:?}", o.log);
     let line = &o.log[0];
     assert!(line.contains(user), "{line:?}");
-    for secret in [CLIENT_SECRET, DEVICE_CODE, USER_CODE, ACCESS_TOKEN, "eyJ"] {
-        assert!(
-            !line.contains(secret),
-            "syslog line leaks {secret:?}: {line:?}"
-        );
+    for (i, secret) in [CLIENT_SECRET, DEVICE_CODE, USER_CODE, ACCESS_TOKEN, "eyJ"]
+        .iter()
+        .enumerate()
+    {
+        assert!(!line.contains(secret), "syslog line leaks secret #{i}");
     }
 }
 

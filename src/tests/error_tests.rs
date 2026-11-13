@@ -117,7 +117,10 @@ fn display_includes_the_detail_of_string_variants() {
             _ => unreachable!(),
         };
         let text = err.to_string();
-        assert!(text.contains(&detail), "{text:?} lacks {detail:?}");
+        assert!(
+            text.contains(&detail),
+            "Display of an error variant lacks its detail"
+        );
     }
 }
 
