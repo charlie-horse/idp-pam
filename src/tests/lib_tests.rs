@@ -248,6 +248,9 @@ struct FakeItems {
     user: Result<String, Error>,
     service: Option<String>,
     rhost: Option<String>,
+    /// What NSS returns as the account's own name.
+    account: Option<String>,
+    account_lookups: Cell<u32>,
 }
 
 impl FakeItems {
@@ -256,6 +259,8 @@ impl FakeItems {
             user: Ok("alice".to_owned()),
             service: service.map(str::to_owned),
             rhost: Some(RHOST.to_owned()),
+            account: Some("alice".to_owned()),
+            account_lookups: Cell::new(0),
         }
     }
 }
@@ -271,6 +276,11 @@ impl PamItems for FakeItems {
 
     fn rhost(&self) -> Option<String> {
         self.rhost.clone()
+    }
+
+    fn account_name(&self) -> Option<String> {
+        self.account_lookups.set(self.account_lookups.get() + 1);
+        self.account.clone()
     }
 }
 
@@ -449,6 +459,8 @@ enum HttpMode {
     Idp,
     /// A client whose every request fails at the transport level.
     Down,
+    /// The fake `IdP`, except that the token endpoint fails at the transport level.
+    TokenDown,
     /// The factory itself fails (e.g. unreadable CA bundle).
     BuildFails(Error),
 }
@@ -531,6 +543,15 @@ impl Env {
                 HttpMode::Down => Ok(Box::new(|_req: HttpRequest| {
                     Err(HttpError::Network("connection refused".to_owned()))
                 })),
+                HttpMode::TokenDown => {
+                    let idp = Rc::clone(&idp);
+                    Ok(Box::new(move |req: HttpRequest| {
+                        if req.uri().path() == TOKEN_PATH {
+                            return Err(HttpError::Tls("certificate expired".to_owned()));
+                        }
+                        Ok(idp.borrow_mut().handle(&req))
+                    }))
+                }
                 HttpMode::BuildFails(e) => Err(e.clone()),
             }
         };
@@ -954,6 +975,44 @@ fn wrong_user_is_auth_err() {
 }
 
 #[test]
+fn claim_matching_a_case_folded_account_is_auth_err() {
+    // NSS resolves "Alice" case-insensitively to alice's entry: an Authentik
+    // user named "Alice" must not log in as alice.
+    let env = Env::new();
+    env.tokens(vec![TokenReply::Ok(env.id_token("Alice", &[]))]);
+    let conv = env.conv(&[]);
+    let mut items = FakeItems::new(Some("login"));
+    items.user = Ok("Alice".to_owned());
+    items.account = Some("alice".to_owned());
+    assert_eq!(
+        env.run(&args(&["methods=sso"]), &conv, &items),
+        PamCode::AuthErr
+    );
+    assert_eq!(items.account_lookups.get(), 1);
+}
+
+#[test]
+fn user_without_a_passwd_entry_is_auth_err() {
+    let env = Env::new();
+    let conv = env.conv(&[]);
+    let mut items = FakeItems::new(Some("login"));
+    items.account = None;
+    assert_eq!(
+        env.run(&args(&["methods=sso"]), &conv, &items),
+        PamCode::AuthErr
+    );
+}
+
+#[test]
+fn password_choice_does_not_look_up_the_account() {
+    let env = Env::new();
+    let conv = env.conv(&["1"]);
+    let items = FakeItems::new(Some("sshd"));
+    assert_eq!(env.run(&args(&[]), &conv, &items), PamCode::Ignore);
+    assert_eq!(items.account_lookups.get(), 0);
+}
+
+#[test]
 fn missing_required_group_is_auth_err() {
     let env = Env::new();
     env.tokens(vec![TokenReply::Ok(env.id_token("alice", &["users"]))]);
@@ -1011,6 +1070,24 @@ fn idp_down_is_authinfo_unavail() {
         run_sso(&env, &[], Some("login"), &[]),
         PamCode::AuthInfoUnavail
     );
+    assert_eq!(
+        env.log_line(),
+        expect_line(Some("alice"), Some(Method::Sso), PamCode::AuthInfoUnavail)
+    );
+}
+
+#[test]
+fn token_endpoint_outage_while_polling_is_authinfo_unavail() {
+    // The device code was issued, then the token endpoint stops answering:
+    // an outage, not an expired code, and reported without waiting for max_wait.
+    let mut env = Env::new();
+    env.http_mode = HttpMode::TokenDown;
+    let start = env.clock.secs();
+    assert_eq!(
+        run_sso(&env, &[], Some("login"), &[]),
+        PamCode::AuthInfoUnavail
+    );
+    assert!(env.clock.secs() - start < 60, "waited for max_wait");
     assert_eq!(
         env.log_line(),
         expect_line(Some("alice"), Some(Method::Sso), PamCode::AuthInfoUnavail)

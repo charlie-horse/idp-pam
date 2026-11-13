@@ -75,6 +75,10 @@
             cargo-deny
             cargo-llvm-cov
           ];
+          # cargo-llvm-cov needs llvm-cov and llvm-profdata from the LLVM that
+          # rustc was built with; nixpkgs' rustc has no llvm-tools-preview.
+          LLVM_COV = "${pkgs.rustc.llvmPackages.llvm}/bin/llvm-cov";
+          LLVM_PROFDATA = "${pkgs.rustc.llvmPackages.llvm}/bin/llvm-profdata";
         };
       });
 

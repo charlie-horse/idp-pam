@@ -1211,20 +1211,208 @@ fn poll_retries_after_transport_failure() {
 }
 
 #[test]
-fn poll_with_persistent_transport_failure_ends_expired() {
+fn poll_with_persistent_tls_failure_is_tls_error_not_expired() {
+    // An IdP that stops answering after the code was issued is an outage
+    // (PAM_AUTHINFO_UNAVAIL), not an expired code (PAM_MAXTRIES).
     let idp = FakeIdp::default();
     idp.on(
         TOKEN_URL,
         Reply::Fail(HttpError::Tls("handshake".to_owned())),
     );
-    let run = poll(&idp, &session(5, 1800, t0() + secs(60)));
-    let r = run.result;
-    assert!(
-        matches!(r, Err(Error::Expired | Error::Tls(_) | Error::Network(_))),
-        "{r:?}"
+    let run = poll(&idp, &session(5, 1800, t0() + secs(600)));
+    assert!(matches!(run.result, Err(Error::Tls(_))), "{:?}", run.result);
+    // It gives up after a few consecutive failures, long before max_wait.
+    assert_eq!(idp.count(TOKEN_URL), 3);
+    assert_eq!(run.sleeps, vec![secs(10), secs(20)]);
+}
+
+#[test]
+fn poll_with_persistent_network_failure_is_network_error() {
+    let idp = FakeIdp::default();
+    idp.on(
+        TOKEN_URL,
+        Reply::Fail(HttpError::Network("connection refused".to_owned())),
     );
+    let run = poll(&idp, &session(5, 1800, t0() + secs(600)));
+    assert!(
+        matches!(run.result, Err(Error::Network(_))),
+        "{:?}",
+        run.result
+    );
+}
+
+#[test]
+fn poll_transport_failure_when_the_deadline_comes_is_a_transport_error() {
+    // Fails, backs off 10 s, fails again; the next wait (20 s) would pass the
+    // deadline (15 s): the outcome is the transport error, not Expired.
+    let idp = FakeIdp::default();
+    idp.on(
+        TOKEN_URL,
+        Reply::Fail(HttpError::Network("connection reset".to_owned())),
+    );
+    let run = poll(&idp, &session(5, 1800, t0() + secs(15)));
+    assert!(
+        matches!(run.result, Err(Error::Network(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.sleeps, vec![secs(10)]);
+}
+
+#[test]
+fn poll_transport_failures_are_counted_only_while_consecutive() {
+    let idp = FakeIdp::default();
+    let fail = || Reply::Fail(HttpError::Network("reset".to_owned()));
+    idp.on(TOKEN_URL, fail());
+    idp.on(TOKEN_URL, fail());
+    idp.on(TOKEN_URL, pending());
+    idp.on(TOKEN_URL, fail());
+    idp.on(TOKEN_URL, fail());
+    idp.on(TOKEN_URL, success());
+    let run = poll(&idp, &session(5, 1800, t0() + secs(600)));
+    assert!(run.result.is_ok(), "{:?}", run.result.err());
+    assert_eq!(
+        run.sleeps,
+        vec![secs(10), secs(20), secs(5), secs(10), secs(20)]
+    );
+}
+
+#[test]
+fn poll_backoff_never_drops_below_the_slowed_down_interval() {
+    // RFC 8628 §3.5: after slow_down the interval grows by 5 s for all later
+    // requests. A transport error must back off from there, not reset to 10 s.
+    let idp = FakeIdp::default();
+    idp.on(TOKEN_URL, slow_down());
+    idp.on(TOKEN_URL, slow_down());
+    idp.on(
+        TOKEN_URL,
+        Reply::Fail(HttpError::Network("timeout".to_owned())),
+    );
+    idp.on(TOKEN_URL, pending());
+    idp.on(TOKEN_URL, success());
+    let run = poll(&idp, &session(5, 1800, t0() + secs(600)));
+    assert!(run.result.is_ok(), "{:?}", run.result.err());
+    assert_eq!(run.sleeps, vec![secs(10), secs(15), secs(30), secs(15)]);
+}
+
+#[test]
+fn poll_backoff_respects_a_long_server_interval() {
+    let idp = FakeIdp::default();
+    idp.on(
+        TOKEN_URL,
+        Reply::Fail(HttpError::Network("timeout".to_owned())),
+    );
+    idp.on(TOKEN_URL, success());
+    let run = poll(&idp, &session(15, 1800, t0() + secs(600)));
+    assert!(run.result.is_ok(), "{:?}", run.result.err());
+    assert_eq!(run.sleeps, vec![secs(30)]);
+}
+
+#[test]
+fn poll_never_sleeps_past_the_deadline() {
+    // An interval longer than the time left must not block past the deadline.
+    let idp = FakeIdp::default();
+    idp.on(TOKEN_URL, pending());
+    let run = poll(&idp, &session(45, 1800, t0() + secs(30)));
+    assert_eq!(run.result.err(), Some(Error::Expired));
     let total: Duration = run.sleeps.iter().sum();
-    assert!(total <= secs(75), "{total:?}");
+    assert!(total <= secs(30), "slept {total:?} past a 30 s deadline");
+}
+
+#[test]
+fn poll_slow_down_never_sleeps_past_the_deadline() {
+    let idp = FakeIdp::default();
+    idp.on(TOKEN_URL, slow_down());
+    let run = poll(&idp, &session(5, 1800, t0() + secs(30)));
+    assert_eq!(run.result.err(), Some(Error::Expired));
+    let total: Duration = run.sleeps.iter().sum();
+    assert!(total <= secs(30), "slept {total:?} past a 30 s deadline");
+}
+
+#[test]
+fn poll_rejects_an_interval_above_the_cap_without_polling() {
+    let idp = FakeIdp::default();
+    idp.on(TOKEN_URL, pending());
+    let run = poll(&idp, &session(3600, 1800, t0() + secs(600)));
+    assert_idp_err(run.result);
+    assert!(run.sleeps.is_empty(), "{:?}", run.sleeps);
+    assert_eq!(idp.count(TOKEN_URL), 0);
+}
+
+#[test]
+fn poll_huge_interval_with_slow_down_does_not_panic() {
+    // oauth2 adds 5 s to the interval on slow_down with an unchecked add.
+    let idp = FakeIdp::default();
+    idp.on(TOKEN_URL, slow_down());
+    let run = poll(&idp, &session(u64::MAX, 1800, t0() + secs(600)));
+    assert_idp_err(run.result);
+    assert!(run.sleeps.is_empty(), "{:?}", run.sleeps);
+}
+
+#[test]
+fn poll_without_a_token_endpoint_is_idp_error() {
+    // Not a provider `discover` returns, but `wait_for_token` takes any.
+    let mut p = provider();
+    p.metadata = p.metadata.set_token_endpoint(None);
+    let idp = FakeIdp::default();
+    let client = idp.client();
+    let clock = FakeClock::at(t0());
+    let sleeper = FakeSleeper::new(&clock);
+    let c = cfg();
+    let sso = Sso {
+        cfg: &c,
+        http: &client,
+        clock: &clock,
+        sleeper: &sleeper,
+    };
+    let r = sso.wait_for_token(&p, &secret(), &session(5, 1800, t0() + secs(600)));
+    assert_idp_err(r);
+    assert!(idp.seen().is_empty());
+}
+
+#[test]
+fn poll_zero_interval_still_waits_a_second() {
+    // `"interval": 0` must not turn into a busy loop against the IdP.
+    let idp = FakeIdp::default();
+    idp.on(TOKEN_URL, pending());
+    idp.on(TOKEN_URL, pending());
+    idp.on(TOKEN_URL, success());
+    let run = poll(&idp, &session(0, 1800, t0() + secs(600)));
+    assert!(run.result.is_ok(), "{:?}", run.result.err());
+    assert_eq!(run.sleeps, vec![MIN_INTERVAL, MIN_INTERVAL]);
+}
+
+#[test]
+fn start_device_rejects_an_interval_longer_than_max_wait() {
+    let mut c = cfg();
+    c.max_wait = secs(30);
+    let idp = FakeIdp::default();
+    idp.on(DEVICE_URL, Reply::Json(200, device_json(true, 1800, 45)));
+    let r = start_with(&c, &provider(), &idp, &FakeClock::at(t0()));
+    assert_idp_err(r);
+}
+
+#[test]
+fn start_device_rejects_an_interval_above_the_cap() {
+    let idp = FakeIdp::default();
+    idp.on(DEVICE_URL, Reply::Json(200, device_json(true, 1800, 3600)));
+    assert_idp_err(start(&idp));
+    let idp = FakeIdp::default();
+    idp.on(
+        DEVICE_URL,
+        Reply::Json(200, device_json(true, 1800, u64::MAX)),
+    );
+    assert_idp_err(start(&idp));
+}
+
+#[test]
+fn start_device_accepts_an_interval_at_the_cap() {
+    let idp = FakeIdp::default();
+    idp.on(
+        DEVICE_URL,
+        Reply::Json(200, device_json(true, 1800, MAX_INTERVAL.as_secs())),
+    );
+    assert!(start(&idp).is_ok());
 }
 
 // ---------------------------------------------------------------------------

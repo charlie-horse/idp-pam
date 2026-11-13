@@ -9,6 +9,8 @@
 //! checked before the JWKS is fetched and so that `device_endpoint` can stand
 //! in for a missing `device_authorization_endpoint`.
 
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use ::http::StatusCode;
@@ -38,6 +40,19 @@ use crate::time::{Clock, Sleeper};
 
 /// How far in the future an ID token's `iat` may lie (clock skew with the `IdP`).
 pub const IAT_LEEWAY: Duration = Duration::from_secs(60);
+
+/// Longest poll interval accepted from the `IdP` (the device response's `interval`).
+pub const MAX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Shortest wait between polls, whatever `interval` the `IdP` sends.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How much each `slow_down` adds to the poll interval (RFC 8628 §3.5).
+pub const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
+
+/// Consecutive transport failures while polling after which the flow ends
+/// with that failure ([`Error::Network`]/[`Error::Tls`]).
+pub const MAX_TRANSPORT_FAILURES: u32 = 3;
 
 /// The non-standard discovery field we need (RFC 8628 §4).
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -141,7 +156,7 @@ pub struct DeviceSession {
     /// The full device response (holds the device code).
     pub details: DeviceDetails,
     /// Our own deadline: start time + min(`expires_in`, `cfg.max_wait`).
-    /// Reaching it is [`Error::Expired`] whatever the library reports.
+    /// [`Sso::wait_for_token`] never sleeps past it.
     pub deadline: SystemTime,
 }
 
@@ -242,8 +257,9 @@ impl Sso<'_> {
     /// Starts the device flow (client authenticated with `secret`, scopes from `cfg`).
     ///
     /// # Errors
-    /// Transport errors as in [`Sso::discover`]; [`Error::Idp`] for an error response
-    /// or a `verification_uri`/`verification_uri_complete` that is not `https`.
+    /// Transport errors as in [`Sso::discover`]; [`Error::Idp`] for an error response,
+    /// a `verification_uri`/`verification_uri_complete` that is not `https`, or an
+    /// `interval` that [`poll_interval`] refuses.
     pub fn start_device(
         &self,
         provider: &Provider,
@@ -278,43 +294,136 @@ impl Sso<'_> {
         {
             return Err(Error::Idp("verification URI is not https".to_owned()));
         }
+        poll_interval(&details, self.cfg)?;
         let deadline = self.clock.now() + start.expires_in.min(self.cfg.max_wait);
         Ok((start, DeviceSession { details, deadline }))
     }
 
-    /// Polls the token endpoint until approval, denial, expiry or `session.deadline`
-    /// (one `request()` call; the library handles `authorization_pending` and `slow_down`).
+    /// Polls the token endpoint until approval, denial, expiry or `session.deadline`.
+    ///
+    /// The loop is ours, not oauth2's (whose loop sleeps past any deadline,
+    /// can overflow on `slow_down`, swallows transport errors and backs off
+    /// below the server's interval). Each request goes through [`Sso::poll_once`].
+    /// - The wait starts at the device response's `interval` (see
+    ///   [`poll_interval`]) and grows by 5 s on each `slow_down` (RFC 8628 §3.5).
+    /// - After a transport error the wait doubles from the current interval
+    ///   (never below it); [`MAX_TRANSPORT_FAILURES`] in a row end the flow
+    ///   with that error.
+    /// - No wait runs past the deadline: when the next one would, the flow
+    ///   ends at once, with the last transport error if the last poll failed
+    ///   and [`Error::Expired`] otherwise.
     ///
     /// # Errors
     /// [`Error::Denied`] for `access_denied`; [`Error::Expired`] for `expired_token`
-    /// or once the deadline passes; [`Error::Idp`] for other error responses or a
-    /// response without an ID token; transport errors as in [`Sso::discover`].
+    /// or at the deadline; [`Error::Network`]/[`Error::Tls`] for transport failures
+    /// as above; [`Error::Idp`] for a bad `interval`, other error responses, or a
+    /// response without an ID token.
     pub fn wait_for_token(
         &self,
         provider: &Provider,
         secret: &SecretString,
         session: &DeviceSession,
     ) -> Result<Tokens, Error> {
-        let clock = self.clock;
-        let timeout = session
+        let mut interval = poll_interval(&session.details, self.cfg)?;
+        let mut failures = 0;
+        if self.time_left(session).is_zero() {
+            return Err(Error::Expired);
+        }
+        loop {
+            let (wait, failure) = match self.poll_once(provider, secret, session)? {
+                Poll::Tokens(tokens) => {
+                    if tokens.id_token().is_none() {
+                        return Err(Error::Idp("token response has no ID token".to_owned()));
+                    }
+                    return Ok(*tokens);
+                }
+                Poll::Pending => {
+                    failures = 0;
+                    (interval, None)
+                }
+                Poll::SlowDown => {
+                    failures = 0;
+                    interval += SLOW_DOWN_STEP;
+                    (interval, None)
+                }
+                Poll::Transport(e) => {
+                    failures += 1;
+                    if failures >= MAX_TRANSPORT_FAILURES {
+                        return Err(e.into());
+                    }
+                    (interval * (1 << failures), Some(e))
+                }
+            };
+            if wait > self.time_left(session) {
+                return Err(failure.map_or(Error::Expired, Error::from));
+            }
+            self.sleeper.sleep(wait);
+        }
+    }
+
+    /// Time until `session.deadline` (zero once it has passed).
+    fn time_left(&self, session: &DeviceSession) -> Duration {
+        session
             .deadline
-            .duration_since(clock.now())
-            .unwrap_or_default();
-        // A provider without a token endpoint (not one from `discover`) ends
-        // in the generic error arm below.
-        let tokens = provider
+            .duration_since(self.clock.now())
+            .unwrap_or_default()
+    }
+
+    /// Sends exactly one token request, through oauth2 so that it builds the
+    /// request (client authentication) and parses the response.
+    ///
+    /// oauth2 only offers a polling loop, so it is held to one round: its
+    /// sleep function records the interval it asks for instead of sleeping,
+    /// and from then on its clock reads past the (zero) timeout, so the loop
+    /// ends with a made-up `expired_token` before a second request. The HTTP
+    /// client records any transport error, which oauth2 would swallow.
+    fn poll_once(
+        &self,
+        provider: &Provider,
+        secret: &SecretString,
+        session: &DeviceSession,
+    ) -> Result<Poll, Error> {
+        let token_url = provider
             .metadata
             .token_endpoint()
-            .map_or(
-                Err(RequestTokenError::Other("no token endpoint".to_owned())),
-                |token_url| {
-                    self.client(provider, secret)
-                        .set_token_uri(token_url.clone())
-                        .exchange_device_access_token(&session.details)
-                        .set_time_fn(move || clock.now().into())
-                        .request(&self.http, |d| self.sleeper.sleep(d), Some(timeout))
+            .ok_or_else(|| Error::Idp("no token endpoint".to_owned()))?;
+        let failure = RefCell::new(None);
+        let http = |req| {
+            (self.http)(req).inspect_err(|e: &HttpError| *failure.borrow_mut() = Some(e.clone()))
+        };
+        let asked = Cell::new(None);
+        let done = AtomicBool::new(false);
+        let now = self.clock.now();
+        let later = now + Duration::from_secs(1);
+        let result = self
+            .client(provider, secret)
+            .set_token_uri(token_url.clone())
+            .exchange_device_access_token(&session.details)
+            .set_time_fn(|| {
+                if done.load(Ordering::Relaxed) {
+                    later.into()
+                } else {
+                    now.into()
+                }
+            })
+            .request(
+                &http,
+                |d| {
+                    asked.set(Some(d));
+                    done.store(true, Ordering::Relaxed);
                 },
-            )
+                Some(Duration::ZERO),
+            );
+        if let Some(asked) = asked.get() {
+            // oauth2 wanted another round: pending, slow_down or a transport error.
+            return Ok(match failure.into_inner() {
+                Some(e) => Poll::Transport(e),
+                None if asked > session.details.interval() => Poll::SlowDown,
+                None => Poll::Pending,
+            });
+        }
+        result
+            .map(|t| Poll::Tokens(Box::new(t)))
             .map_err(|e| match e {
                 RequestTokenError::ServerResponse(r) => match r.error() {
                     DeviceCodeErrorResponseType::AccessDenied => Error::Denied,
@@ -322,11 +431,7 @@ impl Sso<'_> {
                     other => Error::Idp(format!("token endpoint: {}", other.as_ref())),
                 },
                 e => Error::Idp(format!("token endpoint: {e}")),
-            })?;
-        if tokens.id_token().is_none() {
-            return Err(Error::Idp("token response has no ID token".to_owned()));
-        }
-        Ok(tokens)
+            })
     }
 
     /// Verifies the ID token in `tokens`: RS256 only, signature against the JWKS,
@@ -399,6 +504,37 @@ impl Sso<'_> {
         .set_client_secret(ClientSecret::new(secret.expose_secret().to_owned()))
         .disable_openid_scope()
     }
+}
+
+/// What one token request came back with.
+enum Poll {
+    /// The token response (not yet checked for an ID token).
+    Tokens(Box<Tokens>),
+    /// `authorization_pending`.
+    Pending,
+    /// `slow_down`.
+    SlowDown,
+    /// The request failed below HTTP (connect, TLS, timeout, ...).
+    Transport(HttpError),
+}
+
+/// The wait between polls: the device response's `interval`, at least
+/// [`MIN_INTERVAL`] (so that `0` is no busy loop). The interval must not
+/// exceed [`MAX_INTERVAL`] or `cfg.max_wait`: a larger one would block the
+/// PAM caller past `max_wait` (and oauth2 overflows adding 5 s to a huge one
+/// on `slow_down`).
+///
+/// # Errors
+/// [`Error::Idp`] if the interval is too long.
+pub fn poll_interval(details: &DeviceDetails, cfg: &Config) -> Result<Duration, Error> {
+    let interval = details.interval();
+    if interval > MAX_INTERVAL.min(cfg.max_wait) {
+        return Err(Error::Idp(format!(
+            "device response asks for a {}-second poll interval",
+            interval.as_secs()
+        )));
+    }
+    Ok(interval.max(MIN_INTERVAL))
 }
 
 /// Checks the verified claims against PAM and the config: `username` must equal

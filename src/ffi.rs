@@ -95,6 +95,10 @@ impl PamItems for HandleItems {
     fn rhost(&self) -> Option<String> {
         self.rhost.clone()
     }
+
+    fn account_name(&self) -> Option<String> {
+        crate::nss::account_name(self.user.as_ref().ok()?)
+    }
 }
 
 /// [`Conv`] over the handle's `PAM_CONV` item (one message per call).

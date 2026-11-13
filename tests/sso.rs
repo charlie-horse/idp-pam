@@ -146,6 +146,10 @@ impl PamItems for Items {
     fn rhost(&self) -> Option<String> {
         Some("192.0.2.7".to_owned())
     }
+
+    fn account_name(&self) -> Option<String> {
+        Some(self.user.to_owned())
+    }
 }
 
 #[derive(Default)]

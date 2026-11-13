@@ -13,12 +13,12 @@ Or go to https://auth.example.com/device and enter the code WDJB-MJHT
 Press Enter once you've approved (q to cancel):
 ```
 
-It works with a stock OpenSSH client (keyboard-interactive) and at the console, with no daemon and no client-side software.
+It works with a stock OpenSSH client (keyboard-interactive) and at the console (see [Console login](#console-login) for `login`'s own timeout), with no daemon and no client-side software.
 
 - If the user picks the password, the module returns `PAM_IGNORE`, and the next module in the stack (for example `pam_sss`) asks for the password.
 - If the user picks SSO, the module returns `PAM_SUCCESS` only when the ID token's signature, issuer, audience, expiry and `iat` check out, the username claim equals `PAM_USER`, and (if configured) the user is in one of the required groups.
 
-The module is written in Rust on top of [`openidconnect`](https://crates.io/crates/openidconnect) (discovery, device flow, polling, ID-token verification), [`ureq`](https://crates.io/crates/ureq) with rustls (HTTPS), [`pam-bindings`](https://crates.io/crates/pam-bindings) and [`qrcode`](https://crates.io/crates/qrcode). It has no async runtime, starts no threads and reads no environment variables.
+The module is written in Rust on top of [`openidconnect`](https://crates.io/crates/openidconnect) (discovery, device flow, polling, ID-token verification), [`ureq`](https://crates.io/crates/ureq) with rustls (HTTPS), [`pam-bindings`](https://crates.io/crates/pam-bindings) and [`qrcode`](https://crates.io/crates/qrcode). It has no async runtime and starts no threads. Its own code reads no environment variables. Two dependencies do: ureq's default configuration parses the proxy variables (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` and their lowercase forms) before the module discards the result (it uses no proxy), and Rust's panic handler reads `RUST_BACKTRACE` if the module panics.
 
 ## Build and install
 
@@ -41,7 +41,7 @@ The flake also provides:
 | `packages.<system>.{default,pam-idp}` | The module; the build runs `cargo test` |
 | `overlays.default` | Adds `pam-idp` to nixpkgs |
 | `checks.<system>.{build,clippy,fmt}` | The build with its tests, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` |
-| `devShells.<system>.default` | cargo, clippy, rustfmt, rust-analyzer, PAM headers, pamtester, cargo-deny and cargo-llvm-cov |
+| `devShells.<system>.default` | cargo, clippy, rustfmt, rust-analyzer, PAM headers, pamtester, cargo-deny and cargo-llvm-cov (with `LLVM_COV` and `LLVM_PROFDATA` pointing at rustc's own LLVM, so the coverage gate runs in it) |
 | `formatter.<system>` | nixfmt |
 
 ### Without Nix
@@ -75,7 +75,7 @@ Arguments are `key=value` words on the PAM line. Lists are comma-separated and d
 | `require_group` | none (no check) | The user must be in at least one of these groups |
 | `connect_timeout` | `10` | TCP and TLS connect timeout |
 | `timeout` | `30` | Timeout for each later phase of an HTTP request |
-| `max_wait` | `600` | Upper bound on the whole device flow, from the start; the IdP's code expiry also applies |
+| `max_wait` | `600` | Upper bound on the whole device flow, from the start; the IdP's code expiry also applies. The module never waits past it (see [Polling](#polling)) |
 | `wait` | `auto` | `enter`: show "Press Enter once you've approved (q to cancel)" and poll after Enter. `poll`: poll right after showing the code. `auto`: `enter` for the `sshd` service, `poll` otherwise |
 | `qr` | `on` | `on`, `off` (for console fonts without half-block characters) or `invert` |
 | `debug` | off | Bare flag, or `debug=true` / `debug=false`. Accepted, but it currently changes nothing |
@@ -83,6 +83,13 @@ Arguments are `key=value` words on the PAM line. Lists are comma-separated and d
 PAM splits arguments at spaces. To put spaces in a label, wrap the whole argument in brackets: `[labels=Directory password,Single sign-on]`.
 
 Every endpoint the module talks to (discovery, JWKS, device authorization, token) must be `https` and on the issuer's host. The HTTP client follows no redirects, uses no proxy and caps response bodies at 64 KiB.
+
+### Polling
+
+- The module polls the token endpoint every `interval` seconds, as the device response asks (at least 1 s). A response asking for more than 60 s, or more than `max_wait`, is refused as an IdP error.
+- Each `slow_down` adds 5 s to the interval for all later polls (RFC 8628 §3.5).
+- After a transport failure (connect, TLS, timeout) the next wait doubles from the current interval, never dropping below it. Three failures in a row end the login with `PAM_AUTHINFO_UNAVAIL`, as an IdP outage, not an expired code.
+- No wait runs past the deadline (`max_wait` or the code's expiry, whichever comes first). When the next wait would, the login ends at once: with `PAM_MAXTRIES`, or with `PAM_AUTHINFO_UNAVAIL` if the last poll failed at the transport level.
 
 ## PAM stack
 
@@ -107,9 +114,9 @@ What the module returns:
 | --- | --- |
 | SSO verified | `PAM_SUCCESS` |
 | Password chosen | `PAM_IGNORE` |
-| Wrong username, missing group, bad ID-token signature or claims | `PAM_AUTH_ERR` |
+| Wrong username, `PAM_USER` not the exact name of its passwd entry, missing group, bad ID-token signature or claims | `PAM_AUTH_ERR` |
 | Denied at the IdP, code expired, `max_wait` reached, cancelled with `q`, or three invalid menu answers | `PAM_MAXTRIES` |
-| Network, TLS, IdP or client-secret file problem | `PAM_AUTHINFO_UNAVAIL` |
+| Network, TLS, IdP or client-secret file problem, including three failed token polls in a row | `PAM_AUTHINFO_UNAVAIL` |
 | `PAM_USER` unavailable | `PAM_USER_UNKNOWN` |
 | Conversation failure | `PAM_CONV_ERR` |
 | Bad arguments | `PAM_SERVICE_ERR` |
@@ -141,9 +148,14 @@ LoginGraceTime 660
 ```
 
 - The menu and the device-flow prompts run over keyboard-interactive authentication, so every stock OpenSSH client works.
-- Keep `PasswordAuthentication no` if you want every password to go through the menu (and therefore through PAM's keyboard-interactive path).
+- Keep `PasswordAuthentication no`. sshd's `password` method runs the same PAM stack, but its conversation can only answer a hidden password prompt. The menu is a visible prompt, so that conversation fails, `pam_idp` returns `PAM_CONV_ERR`, and `default=die` ends the stack before `pam_sss`. While the menu is on, directory users can't log in with the SSH `password` method at all (for example `ssh -o PreferredAuthentications=password`), even with the right password; only local `pam_unix` accounts can. Directory passwords go through the menu over keyboard-interactive.
 - SSH keys keep working as usual. With the default `AuthenticationMethods`, a key, or keyboard-interactive (SSO or password), is enough.
 - sshd shows PAM info messages only together with the next prompt. That is why `wait=auto` uses the Enter prompt for the `sshd` service: without it the user wouldn't see the code until polling had ended.
+- Every unauthenticated connection that picks SSO costs the IdP a discovery and JWKS fetch, a stored device code and, after Enter, one client-authenticated token request per interval until `max_wait`. It also holds a pre-auth slot for up to `LoginGraceTime`. sshd runs each connection in a fresh process, so nothing is cached between connections. Limit this with sshd's `MaxStartups` and `PerSourcePenalties` (OpenSSH 9.8 and later), rate limits at the IdP or a proxy in front of it, and `max_wait` and `LoginGraceTime` no longer than approval needs.
+
+## Console login
+
+`login` (from shadow or util-linux) aborts the whole login after `LOGIN_TIMEOUT` seconds, 60 by default, counted from the login prompt. With `wait=auto` the console polls without an Enter prompt, so an approval that takes longer than that ends with "Login timed out after 60 seconds" and `pam_idp` never returns. Set `LOGIN_TIMEOUT` in `/etc/login.defs` above `max_wait` (for example `660`), the console counterpart of sshd's `LoginGraceTime`.
 
 ## Authentik setup
 
@@ -161,9 +173,11 @@ LoginGraceTime 660
 ## Security notes
 
 - **Device-code phishing.** The device flow lets anyone who can get a user to open a link and approve it sign in as that user. The approval page shows which application is asking; teach users to approve only a code they have just been shown by their own login. Keep `max_wait` and the code validity short, and use `require_group` to limit SSO to the people who need it.
-- **The client secret.** `secret_file` must be a regular file (symlinks are not followed), owned by the user the module runs as (root for sshd and login), with no group or other permission bits (`chmod 0600`). Otherwise the module refuses it and returns `PAM_AUTHINFO_UNAVAIL`. Error messages name the path, never the content. The secret is held in a `secrecy::SecretString`, which is zeroed when dropped and never printed.
+- **The client secret.** `secret_file` must be a regular file (symlinks are not followed), owned by the user the module runs as (root for sshd and login), with no group or other permission bits (`chmod 0600`). Otherwise the module refuses it and returns `PAM_AUTHINFO_UNAVAIL`. Error messages name the path, never the content, and the module never prints or logs the secret.
+- **Secrets in memory.** Only the module's own copy of the client secret (a `secrecy::SecretString`) is zeroed when dropped. The OAuth library copies the secret into each request it builds, including a base64 `Authorization` header for every token poll, and the HTTP client buffers those requests. The device code, the access, refresh and ID tokens, and the response bodies that carry them are ordinary heap memory as well. None of these copies is zeroed, so a core dump or swapped-out memory of the PAM process (for example sshd's) can contain the client secret and fresh tokens. Disable core dumps for sshd and login (`LimitCORE=0`, `fs.suid_dumpable = 0`), use encrypted swap, and give the client nothing beyond the device flow.
 - **TLS.** The module trusts only the certificates in `ca_file`, never the system store or a bundled root list. Point `ca_file` at a bundle with just your IdP's CA to narrow it further. TLS is rustls with the ring provider.
-- **Token checks.** RS256 signature against the provider's JWKS, issuer, audience (`client_id`), expiry, and `iat` no more than 60 seconds in the future. The username claim must equal `PAM_USER` exactly.
+- **Token checks.** RS256 signature against the provider's JWKS, issuer, audience (`client_id`), expiry, and `iat` no more than 60 seconds in the future. The username claim must equal `PAM_USER` exactly, and `PAM_USER` must be the exact name (`pw_name`) of the passwd entry NSS returns for it. That stops a case-insensitive NSS backend from mapping `Alice` onto `alice`'s account.
+- **Usernames at the IdP.** `preferred_username` is Authentik's editable username, and OIDC doesn't promise that it is unique or stable. Turn off **Allow users to change username** (System → Settings) in Authentik, and keep Authentik's usernames identical to the directory's. Anyone who can rename an Authentik account to a directory username can log in as that user.
 - **What is logged.** One syslog line per authentication (facility `authpriv`, level `info`), with the user, remote host, method and outcome, for example `pam_idp: user=alice rhost=192.0.2.7 method=sso outcome=success`. Never secrets, codes, tokens or claims. Control characters, whitespace and `=` in the user and remote host are replaced with `?`, so a crafted name cannot forge or split the line.
 - **No panics across FFI.** `pam-bindings` catches panics in the hooks and returns `PAM_ABORT`; the release profile keeps `panic = "unwind"` so that this works.
 - **The `.so` dependency tree** has no tokio, reqwest or webpki-roots; `deny.toml` bans tokio and reqwest, and `cargo deny check` enforces it.

@@ -11,6 +11,7 @@ pub mod error;
 pub mod http;
 pub mod log;
 pub mod menu;
+pub mod nss;
 pub mod oidc;
 pub mod pam;
 pub mod prompt;
@@ -48,7 +49,8 @@ pub struct Deps<'a> {
 /// `pam_sm_authenticate`: parse `args`, show the menu, and either hand off to
 /// the password module ([`PamCode::Ignore`]) or run SSO
 /// (discover → device start → show code → optional Enter prompt → poll →
-/// verify ID token → check claims). Logs one line and returns the PAM code
+/// verify ID token → check claims → check that `PAM_USER` is the own name of
+/// its passwd entry). Logs one line and returns the PAM code
 /// per [`Error::pam_code`].
 #[must_use]
 pub fn authenticate(
@@ -106,6 +108,13 @@ fn run(
     let tokens = sso.wait_for_token(&provider, &secret, &session)?;
     let claims = sso.verify_id_token(&provider, &tokens)?;
     oidc::check_claims(&cfg, user, &claims)?;
+    // The session starts for getpwnam(PAM_USER), so the claim must name that
+    // entry exactly, not just a string that NSS folds onto it.
+    if items.account_name().as_deref() != Some(user.as_str()) {
+        return Err(Error::Claim(
+            "PAM user is not the name of its passwd entry".to_owned(),
+        ));
+    }
     Ok(PamCode::Success)
 }
 

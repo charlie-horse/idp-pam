@@ -38,6 +38,11 @@ pub trait PamItems {
 
     /// `PAM_RHOST`, the remote host, if any.
     fn rhost(&self) -> Option<String>;
+
+    /// The own name (`pw_name`) of the passwd entry that `PAM_USER` resolves
+    /// to, or `None` without one ([`crate::nss::account_name`] in production).
+    /// SSO succeeds only if it equals `PAM_USER` exactly.
+    fn account_name(&self) -> Option<String>;
 }
 
 /// Destination for the single syslog line per authentication (`pam_syslog` in production).
