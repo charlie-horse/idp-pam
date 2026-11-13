@@ -3,27 +3,41 @@
 //!
 //! Built on `openidconnect` 4.1; see its `okta_device_grant` example for the
 //! metadata extension. All network calls go through a [`DynHttpClient`].
+//!
+//! Discovery is done by hand (one GET, then [`JsonWebKeySet::fetch`]) rather
+//! than with `ProviderMetadata::discover`, so that the endpoints can be
+//! checked before the JWKS is fetched and so that `device_endpoint` can stand
+//! in for a missing `device_authorization_endpoint`.
 
 use std::time::{Duration, SystemTime};
 
+use ::http::StatusCode;
+use ::http::header::ACCEPT;
 use openidconnect::core::{
-    CoreAuthDisplay, CoreClaimName, CoreClaimType, CoreClientAuthMethod, CoreGenderClaim,
-    CoreGrantType, CoreJsonWebKey, CoreJweContentEncryptionAlgorithm,
-    CoreJweKeyManagementAlgorithm, CoreJwsSigningAlgorithm, CoreResponseMode, CoreResponseType,
-    CoreSubjectIdentifierType, CoreTokenType,
+    CoreAuthDisplay, CoreAuthPrompt, CoreClaimName, CoreClaimType, CoreClientAuthMethod,
+    CoreErrorResponseType, CoreGenderClaim, CoreGrantType, CoreJsonWebKey,
+    CoreJweContentEncryptionAlgorithm, CoreJweKeyManagementAlgorithm, CoreJwsSigningAlgorithm,
+    CoreResponseMode, CoreResponseType, CoreRevocableToken, CoreRevocationErrorResponse,
+    CoreSubjectIdentifierType, CoreTokenIntrospectionResponse, CoreTokenType,
 };
 use openidconnect::{
-    AdditionalClaims, AdditionalProviderMetadata, DeviceAuthorizationResponse,
-    DeviceAuthorizationUrl, EmptyExtraDeviceAuthorizationFields, EmptyExtraTokenFields,
-    IdTokenFields, ProviderMetadata, StandardTokenResponse,
+    AdditionalClaims, AdditionalProviderMetadata, Client, ClientId, ClientSecret,
+    DeviceAuthorizationResponse, DeviceAuthorizationUrl, DeviceCodeErrorResponseType,
+    EmptyExtraDeviceAuthorizationFields, EmptyExtraTokenFields, EndpointNotSet, IdTokenFields,
+    IdTokenVerifier, JsonWebKeySet, Nonce, ProviderMetadata, RequestTokenError, Scope,
+    StandardErrorResponse, StandardTokenResponse, TokenResponse, TokenUrl,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::args::Config;
 use crate::error::Error;
-use crate::http::DynHttpClient;
+use crate::http::{DynHttpClient, HttpError};
 use crate::time::{Clock, Sleeper};
+
+/// How far in the future an ID token's `iat` may lie (clock skew with the `IdP`).
+pub const IAT_LEEWAY: Duration = Duration::from_secs(60);
 
 /// The non-standard discovery field we need (RFC 8628 §4).
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,6 +89,27 @@ pub type Tokens = StandardTokenResponse<IdpIdTokenFields, CoreTokenType>;
 
 /// The raw device authorization response.
 pub type DeviceDetails = DeviceAuthorizationResponse<EmptyExtraDeviceAuthorizationFields>;
+
+/// The openidconnect client, before any endpoint is set.
+type IdpClient = Client<
+    ExtraClaims,
+    CoreAuthDisplay,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJsonWebKey,
+    CoreAuthPrompt,
+    StandardErrorResponse<CoreErrorResponseType>,
+    Tokens,
+    CoreTokenIntrospectionResponse,
+    CoreRevocableToken,
+    CoreRevocationErrorResponse,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+>;
 
 /// Discovered provider: metadata (with JWKS) and the device endpoint to use
 /// (from `cfg.device_endpoint` if set, else from discovery). Every endpoint
@@ -139,7 +174,69 @@ impl Sso<'_> {
     /// bad metadata, a missing device endpoint, an issuer mismatch, or any
     /// endpoint that is not `https` on the issuer's host.
     pub fn discover(&self) -> Result<Provider, Error> {
-        todo!()
+        let issuer = &self.cfg.issuer;
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.as_str().trim_end_matches('/')
+        );
+        // Building the request fails only for a URI that `http` cannot hold;
+        // that is refused like a non-https one.
+        let resp = ::http::Request::get(&url)
+            .header(ACCEPT, "application/json")
+            .body(Vec::new())
+            .ok()
+            .map_or(Err(HttpError::Insecure(url)), self.http)?;
+        if resp.status() != StatusCode::OK {
+            return Err(Error::Idp(format!(
+                "discovery returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let mut metadata: DeviceProviderMetadata = serde_json::from_slice(resp.body())
+            .and_then(|mut doc: serde_json::Map<String, Value>| {
+                if let Some(ep) = &self.cfg.device_endpoint {
+                    doc.insert(
+                        "device_authorization_endpoint".to_owned(),
+                        Value::from(ep.as_str()),
+                    );
+                }
+                serde_json::from_value(Value::Object(doc))
+            })
+            .map_err(|e| Error::Idp(format!("bad discovery document: {e}")))?;
+        if metadata.issuer().url() != issuer {
+            return Err(Error::Idp(format!(
+                "discovery names issuer {}, expected {issuer}",
+                metadata.issuer().as_str()
+            )));
+        }
+        let device_endpoint = metadata
+            .additional_metadata()
+            .device_authorization_endpoint
+            .clone();
+        let endpoints = [
+            ("jwks_uri", Some(metadata.jwks_uri().url())),
+            (
+                "token_endpoint",
+                metadata.token_endpoint().map(TokenUrl::url),
+            ),
+            ("device_authorization_endpoint", Some(device_endpoint.url())),
+        ];
+        for (name, url) in endpoints {
+            if !url.is_some_and(|u| u.scheme() == "https" && u.origin() == issuer.origin()) {
+                return Err(Error::Idp(format!(
+                    "{name} is missing or not https on the issuer's host"
+                )));
+            }
+        }
+        let jwks = JsonWebKeySet::fetch(metadata.jwks_uri(), &self.http).map_err(|e| match e {
+            openidconnect::DiscoveryError::Request(e) => Error::from(e),
+            e => Error::Idp(format!("JWKS: {e}")),
+        })?;
+        metadata = metadata.set_jwks(jwks);
+        Ok(Provider {
+            metadata,
+            device_endpoint,
+        })
     }
 
     /// Starts the device flow (client authenticated with `secret`, scopes from `cfg`).
@@ -149,10 +246,40 @@ impl Sso<'_> {
     /// or a `verification_uri`/`verification_uri_complete` that is not `https`.
     pub fn start_device(
         &self,
-        _provider: &Provider,
-        _secret: &SecretString,
+        provider: &Provider,
+        secret: &SecretString,
     ) -> Result<(DeviceStart, DeviceSession), Error> {
-        todo!()
+        let details: DeviceDetails = self
+            .client(provider, secret)
+            .set_device_authorization_url(provider.device_endpoint.clone())
+            .exchange_device_code()
+            .add_scopes(self.cfg.scopes.iter().cloned().map(Scope::new))
+            .request(&self.http)
+            .map_err(|e| match e {
+                RequestTokenError::Request(e) => Error::from(e),
+                // Only the error code: the description may echo request data.
+                RequestTokenError::ServerResponse(r) => Error::Idp(format!(
+                    "device authorization refused: {}",
+                    r.error().as_ref()
+                )),
+                e => Error::Idp(format!("device authorization: {e}")),
+            })?;
+        let start = DeviceStart {
+            verification_uri: details.verification_uri().as_str().to_owned(),
+            verification_uri_complete: details
+                .verification_uri_complete()
+                .map(|u| u.secret().clone()),
+            user_code: details.user_code().secret().clone(),
+            expires_in: details.expires_in(),
+        };
+        if std::iter::once(&start.verification_uri)
+            .chain(&start.verification_uri_complete)
+            .any(|u| !u.starts_with("https://"))
+        {
+            return Err(Error::Idp("verification URI is not https".to_owned()));
+        }
+        let deadline = self.clock.now() + start.expires_in.min(self.cfg.max_wait);
+        Ok((start, DeviceSession { details, deadline }))
     }
 
     /// Polls the token endpoint until approval, denial, expiry or `session.deadline`
@@ -164,35 +291,134 @@ impl Sso<'_> {
     /// response without an ID token; transport errors as in [`Sso::discover`].
     pub fn wait_for_token(
         &self,
-        _provider: &Provider,
-        _secret: &SecretString,
-        _session: &DeviceSession,
+        provider: &Provider,
+        secret: &SecretString,
+        session: &DeviceSession,
     ) -> Result<Tokens, Error> {
-        todo!()
+        let clock = self.clock;
+        let timeout = session
+            .deadline
+            .duration_since(clock.now())
+            .unwrap_or_default();
+        // A provider without a token endpoint (not one from `discover`) ends
+        // in the generic error arm below.
+        let tokens = provider
+            .metadata
+            .token_endpoint()
+            .map_or(
+                Err(RequestTokenError::Other("no token endpoint".to_owned())),
+                |token_url| {
+                    self.client(provider, secret)
+                        .set_token_uri(token_url.clone())
+                        .exchange_device_access_token(&session.details)
+                        .set_time_fn(move || clock.now().into())
+                        .request(&self.http, |d| self.sleeper.sleep(d), Some(timeout))
+                },
+            )
+            .map_err(|e| match e {
+                RequestTokenError::ServerResponse(r) => match r.error() {
+                    DeviceCodeErrorResponseType::AccessDenied => Error::Denied,
+                    DeviceCodeErrorResponseType::ExpiredToken => Error::Expired,
+                    other => Error::Idp(format!("token endpoint: {}", other.as_ref())),
+                },
+                e => Error::Idp(format!("token endpoint: {e}")),
+            })?;
+        if tokens.id_token().is_none() {
+            return Err(Error::Idp("token response has no ID token".to_owned()));
+        }
+        Ok(tokens)
     }
 
     /// Verifies the ID token in `tokens`: RS256 only, signature against the JWKS,
     /// `iss`, `aud` (must contain `client_id`), `azp` (if present, must equal
-    /// `client_id`), `exp`, and `iat` (not in the future), using `clock`. The
+    /// `client_id`), `exp`, and `iat` (at most [`IAT_LEEWAY`] in the future), using `clock`. The
     /// nonce is not checked (the device flow has none).
     ///
     /// # Errors
     /// [`Error::Token`] for any verification failure or a missing ID token;
     /// [`Error::Claim`] if the username claim is missing or not a string, or the
     /// groups claim is not a list of strings.
-    pub fn verify_id_token(&self, _provider: &Provider, _tokens: &Tokens) -> Result<Claims, Error> {
-        todo!()
+    pub fn verify_id_token(&self, provider: &Provider, tokens: &Tokens) -> Result<Claims, Error> {
+        let cfg = self.cfg;
+        let clock = self.clock;
+        let id_token = tokens
+            .id_token()
+            .ok_or(Error::Token("no ID token".to_owned()))?;
+        let verifier = IdTokenVerifier::new_public_client(
+            ClientId::new(cfg.client_id.clone()),
+            provider.metadata.issuer().clone(),
+            provider.metadata.jwks().clone(),
+        )
+        .set_time_fn(move || clock.now().into())
+        .set_issue_time_verifier_fn(move |iat| {
+            if SystemTime::from(iat) > clock.now() + IAT_LEEWAY {
+                Err(format!("issued in the future ({iat})"))
+            } else {
+                Ok(())
+            }
+        });
+        let claims = id_token
+            .claims(&verifier, |_: Option<&Nonce>| Ok(()))
+            .map_err(|e| Error::Token(e.to_string()))?;
+        if claims
+            .authorized_party()
+            .is_some_and(|azp| azp.as_str() != cfg.client_id)
+        {
+            return Err(Error::Token("azp is not our client_id".to_owned()));
+        }
+        // Standard and additional claims alike, by name.
+        let all = serde_json::to_value(claims).unwrap_or_default();
+        let username = all
+            .get(&cfg.username_claim)
+            .and_then(Value::as_str)
+            .ok_or(Error::Claim(format!(
+                "claim {} is missing or not a string",
+                cfg.username_claim
+            )))?
+            .to_owned();
+        let groups = all
+            .get(&cfg.groups_claim)
+            .map_or(Ok(Vec::new()), |g| serde_json::from_value(g.clone()))
+            .map_err(|_| {
+                Error::Claim(format!(
+                    "claim {} is not a list of strings",
+                    cfg.groups_claim
+                ))
+            })?;
+        Ok(Claims { username, groups })
+    }
+
+    /// The openidconnect client for `provider`, authenticated with `secret`.
+    /// openidconnect's automatic `openid` scope is off: `cfg.scopes` is sent as is.
+    fn client(&self, provider: &Provider, secret: &SecretString) -> IdpClient {
+        IdpClient::new(
+            ClientId::new(self.cfg.client_id.clone()),
+            provider.metadata.issuer().clone(),
+            provider.metadata.jwks().clone(),
+        )
+        .set_client_secret(ClientSecret::new(secret.expose_secret().to_owned()))
+        .disable_openid_scope()
     }
 }
 
 /// Checks the verified claims against PAM and the config: `username` must equal
-/// `pam_user`, and if `cfg.require_group` is non-empty, `groups` must contain at
+/// `pam_user` (an empty `pam_user` never matches), and if `cfg.require_group` is non-empty, `groups` must contain at
 /// least one of them.
 ///
 /// # Errors
 /// [`Error::Claim`] naming the failed check (not the token).
-pub fn check_claims(_cfg: &Config, _pam_user: &str, _claims: &Claims) -> Result<(), Error> {
-    todo!()
+pub fn check_claims(cfg: &Config, pam_user: &str, claims: &Claims) -> Result<(), Error> {
+    if pam_user.is_empty() || claims.username != pam_user {
+        return Err(Error::Claim(format!(
+            "{} does not match the PAM user",
+            cfg.username_claim
+        )));
+    }
+    if !cfg.require_group.is_empty() && !claims.groups.iter().any(|g| cfg.require_group.contains(g))
+    {
+        return Err(Error::Claim("none of the required groups".to_owned()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

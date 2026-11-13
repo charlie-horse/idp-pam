@@ -149,7 +149,11 @@ fn send(agent: &Agent, req: HttpRequest) -> Result<HttpResponse, HttpError> {
 fn classify(e: ureq::Error) -> HttpError {
     match e {
         ureq::Error::BodyExceedsLimit(_) => HttpError::TooLarge,
-        ureq::Error::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) => {
+        ureq::Error::Io(io)
+            if io
+                .get_ref()
+                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<rustls::Error>) =>
+        {
             HttpError::Tls(io.to_string())
         }
         e => HttpError::Network(e.to_string()),
