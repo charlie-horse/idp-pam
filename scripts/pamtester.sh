@@ -2,25 +2,28 @@
 # End-to-end check of pam_idp.so with pamtester against examples/mock_idp.
 #
 # Usage (as root, on a scratch machine or container):
-#   1. As any user:  cargo build --release && cargo run --release --example mock_idp
-#   2. As root:      scripts/pamtester.sh
+#   1. As any user:  cargo build --release
+#                    cargo run --release --example mock_idp -- /tmp/pam-idp-mock
+#   2. As root:      MOCK_DIR=/tmp/pam-idp-mock scripts/pamtester.sh
 #
 # The script writes /etc/pam.d/idp-test (and idp-test-enter, idp-test-down)
 # with the plan's stack, pam_permit standing in for pam_sss, creates two
 # throwaway local users, runs the cases below and prints a pass/fail
 # summary. Everything it creates is removed on exit.
 #
-# Contract with examples/mock_idp (defaults shown; override with env vars):
-#   MOCK_DIR=/tmp/pam-idp-mock   the mock writes these files there:
-#       issuer         the issuer URL, e.g. https://localhost:8443
+# Contract with examples/mock_idp (see its module doc):
+#   MOCK_DIR (default: the current directory, where the mock writes when
+#   started without an argument) holds the files the mock writes at start:
+#       issuer         the issuer URL, https://127.0.0.1:8443/application/o/login/
 #       client_id      the OAuth client id it accepts
 #       client_secret  the matching client secret
-#       ca.pem         the CA bundle that signs its TLS certificate
-#   POST <issuer>/mock/decision with a text body sets how every pending and
-#   future device authorization resolves when polled:
-#       "approve <username>"  ID token with preferred_username=<username>
-#       "deny"                access_denied
-#       "pending"             authorization_pending (the default)
+#       ca.pem         the CA that signs its TLS certificate
+#   These set how every pending and future device authorization resolves
+#   when polled (GET on the issuer's origin):
+#       /_test/approve?user=NAME  ID token with preferred_username=NAME
+#       /_test/deny               access_denied
+#       /_test/pending            authorization_pending (the start state)
+#   The verification URI it hands out is <origin>/if/device/.
 #   MODULE=<repo>/target/release/libpam_idp.so (falls back to target/debug)
 
 set -euo pipefail
@@ -38,7 +41,7 @@ for tool in pamtester curl useradd userdel chpasswd install; do
 done
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-mock_dir="${MOCK_DIR:-/tmp/pam-idp-mock}"
+mock_dir="${MOCK_DIR:-${PWD}}"
 
 module="${MODULE:-}"
 if [[ -z ${module} ]]; then
@@ -62,6 +65,12 @@ for f in issuer client_id client_secret ca.pem; do
 done
 issuer="$(<"${mock_dir}/issuer")"
 client_id="$(<"${mock_dir}/client_id")"
+if [[ ! ${issuer} =~ ^(https://[^/]+) ]]; then
+    echo "pamtester.sh: ${mock_dir}/issuer is not an https URL" >&2
+    exit 2
+fi
+origin="${BASH_REMATCH[1]}"
+verify_uri="${origin}/if/device/"
 
 # Root-owned copies: the module insists on a secret file owned by its euid
 # with no group/other bits, and the mock runs as an ordinary user.
@@ -124,10 +133,15 @@ write_service idp-test-enter "${issuer}" "wait=enter qr=off"
 # Nothing listens on port 1: discovery fails.
 write_service idp-test-down "https://127.0.0.1:1" "wait=poll"
 
+# decide approve NAME | deny | pending
 decide() {
-    curl --silent --show-error --fail --cacert "${ca}" \
-        --data-binary "$1" -H 'Content-Type: text/plain' \
-        "${issuer%/}/mock/decision" >/dev/null
+    local path
+    case $1 in
+    approve) path="approve?user=$2" ;;
+    *) path=$1 ;;
+    esac
+    curl --silent --show-error --fail --noproxy '*' --cacert "${ca}" \
+        "${origin}/_test/${path}" >/dev/null
 }
 
 if ! decide pending; then
@@ -175,20 +189,20 @@ run_case() {
 }
 
 # 1. SSO approved (empty answer picks default=sso; the mock approves as the PAM user).
-decide "approve ${sso_user}"
-run_case "sso approved" idp-test "${sso_user}" '\n' 0 "${ok_text}" "${issuer#https://}"
+decide approve "${sso_user}"
+run_case "sso approved" idp-test "${sso_user}" '\n' 0 "${ok_text}" "${verify_uri}"
 
 # 2. SSO denied at the IdP: PAM_MAXTRIES, pam_permit is not reached.
 decide deny
 run_case "sso denied" idp-test "${sso_user}" '2\n' 1 "${maxtries_text}"
 
 # 3. ID token for another user: PAM_AUTH_ERR.
-decide "approve mallory"
+decide approve mallory
 run_case "sso wrong user" idp-test "${sso_user}" '2\n' 1 "${autherr_text}"
 
 # 4. Menu option 1 (password): PAM_IGNORE, then pam_permit (standing in for pam_sss).
 decide pending
-run_case "menu option 1" idp-test "${sso_user}" '1\n' 0 "${ok_text}" "Password" "${issuer#https://}"
+run_case "menu option 1" idp-test "${sso_user}" '1\n' 0 "${ok_text}" "Password" "${verify_uri}"
 
 # 5. Bad menu input three times: PAM_MAXTRIES.
 run_case "bad menu input" idp-test "${sso_user}" '9\nx\n7\n' 1 "${maxtries_text}"
@@ -197,7 +211,7 @@ run_case "bad menu input" idp-test "${sso_user}" '9\nx\n7\n' 1 "${maxtries_text}
 run_case "enter prompt cancel" idp-test-enter "${sso_user}" '2\nq\n' 1 "${maxtries_text}" "Press Enter"
 
 # 7. Enter prompt, then approved.
-decide "approve ${sso_user}"
+decide approve "${sso_user}"
 run_case "enter prompt approve" idp-test-enter "${sso_user}" '2\n\n' 0 "${ok_text}" "Press Enter"
 
 # 8. IdP unreachable: PAM_AUTHINFO_UNAVAIL.

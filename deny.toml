@@ -1,0 +1,60 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# Run locally with `cargo deny check`; CI runs it in .github/workflows/deny.yml.
+
+[graph]
+# Only the crates that end up in pam_idp.so are checked. httpmock (a
+# dev-dependency used by the tests) pulls in tokio and hyper, which must never
+# reach the module itself; excluding dev-dependencies lets the tokio ban below
+# apply to the shipped dependency tree without tripping over the test server.
+all-features = true
+exclude-dev = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# RustSec advisory database. Vulnerabilities and unsound crates are errors by
+# default; unmaintained crates are reported for the whole graph.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+  # Marvin Attack (timing side channel in RSA private-key operations) in rsa
+  # 0.9, pulled in by openidconnect 4.1. The module only verifies ID-token
+  # signatures with the IdP's public keys and never holds an RSA private key;
+  # private-key signing appears only in the tests. Drop this once openidconnect
+  # moves to rsa 0.10.
+  { id = "RUSTSEC-2023-0071", reason = "public-key verification only; no RSA private key in the module" },
+]
+
+[licenses]
+# Every licence must be on this list (all compatible with Apache-2.0).
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# The module runs inside sshd and login: no async runtime, and no HTTP client
+# that starts one (reqwest's blocking client spawns a tokio thread).
+deny = [
+  { crate = "reqwest", reason = "blocking client starts a tokio runtime thread inside the PAM caller" },
+  { crate = "tokio", reason = "no async runtime or background threads inside the PAM caller" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

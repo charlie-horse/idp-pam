@@ -1053,6 +1053,26 @@ fn discovery_without_device_endpoint_is_authinfo_unavail() {
 }
 
 #[test]
+fn bad_device_authorization_response_is_authinfo_unavail() {
+    let env = Env::new();
+    env.idp.borrow_mut().device = json!({ "error": "invalid_client" });
+    let conv = env.conv(&[""]);
+    assert_eq!(
+        run_sso_with_conv(&env, &conv, Some("login")),
+        PamCode::AuthInfoUnavail
+    );
+    assert!(
+        conv.infos().is_empty(),
+        "no code shown without a device code"
+    );
+    assert_eq!(env.token_polls(), 0);
+    assert_eq!(
+        env.log_line(),
+        expect_line(Some("alice"), Some(Method::Sso), PamCode::AuthInfoUnavail)
+    );
+}
+
+#[test]
 fn unreadable_secret_is_authinfo_unavail() {
     let mut env = Env::new();
     env.secrets.value = Err(Error::Secret("mode 0644".into()));
