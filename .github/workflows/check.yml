@@ -1,0 +1,76 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  nix:
+    name: nix flake check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64-linux and aarch64-linux: build, cargo test, clippy, rustfmt.
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read # check out the source
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+        with:
+          # Read-only token, used only for fetching the pinned nixpkgs from GitHub.
+          github_access_token: ${{ github.token }}
+
+      - name: nix flake check
+        run: nix flake check -L
+
+  coverage:
+    name: coverage (100% lines and regions)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out the source
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install libpam headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev
+
+      # rustup is preinstalled on the runner; no third-party action needed.
+      - name: Install Rust (stable, llvm-tools-preview)
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      # src/ffi.rs runs only inside libpam (covered end to end by tests/ffi.rs
+      # and scripts/pamtester.sh); test code and examples are not measured.
+      - name: cargo llvm-cov
+        run: >-
+          cargo llvm-cov --locked --all-targets
+          --fail-under-lines 100 --fail-under-regions 100
+          --ignore-filename-regex '(src/ffi\.rs|src/tests/|tests/|examples/)'
