@@ -15,9 +15,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 http = "=1.5.0"
-oauth2 = { version = "=5.0.0", default-features = false }
 openidconnect = { version = "=4.1.0", default-features = false }
-pam-bindings = "=0.4.0"
+pam_bindings = { package = "pam-bindings", version = "=0.4.0" }
 qrcode = { version = "=0.14.1", default-features = false }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "=1.16.0", features = ["std"] }
