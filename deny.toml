@@ -24,6 +24,11 @@ ignore = [
   # private-key signing appears only in the tests. Drop this once openidconnect
   # moves to rsa 0.10.
   { id = "RUSTSEC-2023-0071", reason = "public-key verification only; no RSA private key in the module" },
+  # chrono is unmaintained (informational, no vulnerability). It reaches the
+  # module only through openidconnect 4.1 and oauth2 5.0, whose public APIs use
+  # chrono types; no release of either drops it, and no other OIDC client crate
+  # avoids both chrono and reqwest. The module itself does not use chrono.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, not vulnerable; required by openidconnect and oauth2" },
 ]
 
 [licenses]
